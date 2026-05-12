@@ -6,6 +6,8 @@ Conquer planets rotating around a sun in continuous 2D space. A real-time strate
 
 Players start with a single home planet and compete to control the map by sending fleets to capture neutral and enemy planets. The board is a 100x100 continuous space with a sun at the center. Planets orbit the sun, comets fly through on elliptical trajectories, and fleets travel in straight lines. The game lasts 500 turns. The player with the most total ships (on planets + in fleets) at the end wins.
 
+Self-play HTML replay (same agent twice): `conda run -n crypto python watch_selfplay.py` → open `replay.html` (add `--open` to launch the browser).
+
 ## Board Layout
 
 - **Board**: 100x100 continuous space, origin at top-left.
