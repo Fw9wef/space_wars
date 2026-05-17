@@ -11,14 +11,15 @@ Strategy:
 
 Key concepts demonstrated:
   - Parsing the observation (planets, player ID, dynamics fields)
-  - Fleet heading from orbit_dynamics.intercept_angle_for_target
+  - Fleet heading from continuous_intercept.intercept_angle_for_target
   - Sending moves as [from_planet_id, angle, num_ships]
 """
 
 import math
 from kaggle_environments.envs.orbit_wars.orbit_wars import Planet
 
-from orbit_dynamics import intercept_angle_for_target
+from continuous_intercept import intercept_angle_for_target
+#from orbit_dynamics import intercept_angle_for_target
 
 
 def _obs_get(obs, key, default=None):

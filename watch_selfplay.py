@@ -8,13 +8,112 @@
 from __future__ import annotations
 
 import argparse
+import sys
 import webbrowser
+from dataclasses import dataclass
 from pathlib import Path
+from time import perf_counter
 
 from kaggle_environments import make
-
 _ROOT = Path(__file__).resolve().parent
 _DEFAULT_AGENT = _ROOT / "main.py"
+
+if str(_ROOT) not in sys.path:
+    sys.path.insert(0, str(_ROOT))
+
+
+@dataclass
+class TimingStats:
+    agent_s: float = 0.0
+    env_s: float = 0.0
+    intercept_s: float = 0.0
+    intercept_calls: int = 0
+    agent_calls: int = 0
+    env_steps: int = 0
+    episode_s: float = 0.0
+    render_s: float = 0.0
+
+
+def install_intercept_timer(stats: TimingStats) -> None:
+    """Patch intercept_angle_for_target before the agent module is loaded."""
+    import continuous_intercept
+    import orbit_dynamics
+
+    for mod in (orbit_dynamics, continuous_intercept):
+        original = mod.intercept_angle_for_target
+
+        def timed(*args, _orig=original, **kwargs):
+            t0 = perf_counter()
+            try:
+                return _orig(*args, **kwargs)
+            finally:
+                stats.intercept_s += perf_counter() - t0
+                stats.intercept_calls += 1
+
+        mod.intercept_angle_for_target = timed
+
+
+def run_episode_timed(env, agent_paths: list[Path], stats: TimingStats) -> None:
+    """Same as env.run, but accumulates agent / env step times."""
+    agent_specs = [str(p) for p in agent_paths]
+    runner = env._Environment__agent_runner(agent_specs)  # noqa: SLF001
+
+    if env.state is None or len(env.steps) == 1 or env.done:
+        env.reset(len(agent_specs))
+    if len(env.state) != len(agent_specs):
+        raise ValueError(f"expected {len(env.state)} agents, got {len(agent_specs)}")
+
+    deadline = perf_counter() + float(env.configuration.runTimeout)
+    t_episode = perf_counter()
+    while not env.done and perf_counter() < deadline:
+        t0 = perf_counter()
+        actions, logs = runner.act()
+        stats.agent_s += perf_counter() - t0
+        stats.agent_calls += len(agent_specs)
+
+        t0 = perf_counter()
+        env.step(actions, logs)
+        stats.env_s += perf_counter() - t0
+        stats.env_steps += 1
+
+    stats.episode_s = perf_counter() - t_episode
+
+
+def print_timing_stats(stats: TimingStats) -> None:
+    ep = stats.episode_s
+    agent = stats.agent_s
+    env = stats.env_s
+    theta = stats.intercept_s
+    agent_rest = max(0.0, agent - theta)
+    overhead = max(0.0, ep - agent - env)
+
+    def pct(part: float, whole: float) -> float:
+        return 100.0 * part / whole if whole > 0 else 0.0
+
+    print()
+    print("=== Время (сек) ===")
+    print(f"  эпизод (ходы):     {ep:10.3f}")
+    print(f"  среда (step):      {env:10.3f}  ({stats.env_steps} шагов)")
+    print(f"  агент (всего):     {agent:10.3f}  ({stats.agent_calls} вызовов)")
+    print(f"    └ поиск θ:       {theta:10.3f}  ({stats.intercept_calls} вызовов intercept)")
+    print(f"    └ остальное:     {agent_rest:10.3f}")
+    if overhead > 0.001:
+        print(f"  прочее в цикле:    {overhead:10.3f}")
+    if stats.render_s > 0:
+        print(f"  HTML render:       {stats.render_s:10.3f}")
+
+    print()
+    print("=== Доля от времени эпизода ===")
+    print(f"  среда:             {pct(env, ep):6.1f}%")
+    print(f"  агент (всего):     {pct(agent, ep):6.1f}%")
+    print(f"    поиск θ:         {pct(theta, ep):6.1f}%  ({pct(theta, agent):.1f}% от агента)")
+    print(f"    остальное:       {pct(agent_rest, ep):6.1f}%")
+    if stats.intercept_calls:
+        print(f"  среднее на intercept: {theta / stats.intercept_calls * 1e3:.2f} ms")
+    if stats.agent_calls:
+        print(f"  среднее на вызов agent: {agent / stats.agent_calls * 1e3:.2f} ms")
+    if stats.env_steps:
+        print(f"  среднее на step среды:  {env / stats.env_steps * 1e3:.2f} ms")
 
 
 def _obs_get(obs: object, key: str, default):
@@ -75,8 +174,11 @@ def main() -> None:
     if args.episode_steps is not None:
         configuration["episodeSteps"] = args.episode_steps
 
+    stats = TimingStats()
+    install_intercept_timer(stats)
+
     env = make("orbit_wars", configuration=configuration, debug=True)
-    env.run([str(agent_path), str(agent_path)])
+    run_episode_timed(env, [agent_path, agent_path], stats)
 
     final = env.steps[-1]
     num_agents = len(final)
@@ -85,13 +187,16 @@ def main() -> None:
     for i, s in enumerate(final):
         print(f"Player {i}: reward={s.reward}, status={s.status}, ships_total={totals[i]}")
 
+    t0 = perf_counter()
     html = env.render(mode="html", width=800, height=600)
+    stats.render_s = perf_counter() - t0
     if not isinstance(html, str) or not html.strip():
         raise SystemExit("env.render(mode='html') did not return HTML string")
     out = output_path_with_scores(args.output.resolve(), totals)
     out.parent.mkdir(parents=True, exist_ok=True)
     out.write_text(html, encoding="utf-8")
     print(f"Wrote {out}")
+    print_timing_stats(stats)
     if args.open:
         webbrowser.open(out.as_uri())
 
