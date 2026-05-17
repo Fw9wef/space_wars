@@ -10,19 +10,36 @@ Strategy:
   enough to capture it (garrison + 1). Otherwise, wait and accumulate.
 
 Key concepts demonstrated:
-  - Parsing the observation (planets, player ID)
-  - Computing angles with atan2 for fleet direction
+  - Parsing the observation (planets, player ID, dynamics fields)
+  - Fleet heading from orbit_dynamics.intercept_angle_for_target
   - Sending moves as [from_planet_id, angle, num_ships]
 """
 
 import math
 from kaggle_environments.envs.orbit_wars.orbit_wars import Planet
 
+from orbit_dynamics import intercept_angle_for_target
+
+
+def _obs_get(obs, key, default=None):
+    if isinstance(obs, dict):
+        return obs.get(key, default)
+    return getattr(obs, key, default)
+
 
 def agent(obs):
     moves = []
-    player = obs.get("player", 0) if isinstance(obs, dict) else obs.player
-    raw_planets = obs.get("planets", []) if isinstance(obs, dict) else obs.planets
+    player = int(_obs_get(obs, "player", 0))
+    raw_planets = _obs_get(obs, "planets", []) or []
+    planets_rows = list(raw_planets)
+    initial = list(_obs_get(obs, "initial_planets", []) or [])
+    omega = float(_obs_get(obs, "angular_velocity", 0.0))
+    step = int(_obs_get(obs, "step", 0))
+    comets = list(_obs_get(obs, "comets") or [])
+    cids = list(_obs_get(obs, "comet_planet_ids") or [])
+    cfg = _obs_get(obs, "configuration")
+
+    by_id = {int(p[0]): p for p in planets_rows}
 
     # Parse into named tuples for readable field access:
     #   Planet(id, owner, x, y, radius, ships, production)
@@ -53,8 +70,22 @@ def agent(obs):
 
         # Only launch if we can afford it — otherwise keep accumulating
         if mine.ships >= ships_needed:
-            # atan2(dy, dx) gives the angle from our planet to the target
-            angle = math.atan2(nearest.y - mine.y, nearest.x - mine.x)
+            mine_row = by_id[int(mine.id)]
+            nearest_row = by_id[int(nearest.id)]
+            angle, _feasible = intercept_angle_for_target(
+                mine_row,
+                nearest_row,
+                ships_needed,
+                planets_rows,
+                initial,
+                omega,
+                step,
+                comets,
+                cids,
+                cfg,
+            )
+            if angle is None:
+                angle = math.atan2(nearest.y - mine.y, nearest.x - mine.x)
             moves.append([mine.id, angle, ships_needed])
 
     return moves
