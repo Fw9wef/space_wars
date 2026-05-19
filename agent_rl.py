@@ -12,7 +12,7 @@ from pathlib import Path
 from rl.runner import RLAgent
 
 _ROOT = Path(__file__).resolve().parent
-_DEFAULT_CKPT = _ROOT / "runs" / "ppo_v0" / "checkpoint.pt"
+_DEFAULT_CKPT = _ROOT / "runs" / "ppo_graph_v0" / "checkpoint.pt"
 _agent: RLAgent | None = None
 
 

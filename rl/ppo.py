@@ -1,4 +1,4 @@
-"""PPO update."""
+"""PPO update for graph policy."""
 
 from __future__ import annotations
 
@@ -9,7 +9,7 @@ import torch
 import torch.nn as nn
 
 from rl.buffer import RolloutBatch
-from rl.policy import ActorCritic
+from rl.graph_policy import GraphActorCritic
 
 
 @dataclass
@@ -26,7 +26,7 @@ class PPOConfig:
 
 
 class PPOTrainer:
-    def __init__(self, policy: ActorCritic, config: PPOConfig | None = None) -> None:
+    def __init__(self, policy: GraphActorCritic, config: PPOConfig | None = None) -> None:
         self.policy = policy
         self.config = config or PPOConfig()
         self.optimizer = torch.optim.Adam(policy.parameters(), lr=self.config.lr, eps=1e-5)
@@ -35,11 +35,14 @@ class PPOTrainer:
         cfg = self.config
         device = next(self.policy.parameters()).device
 
-        obs = torch.as_tensor(batch.obs, dtype=torch.float32, device=device)
+        nodes = torch.as_tensor(batch.nodes, dtype=torch.float32, device=device)
+        edges = torch.as_tensor(batch.edges, dtype=torch.float32, device=device)
+        global_f = torch.as_tensor(batch.global_features, dtype=torch.float32, device=device)
         actions = torch.as_tensor(batch.actions, dtype=torch.long, device=device)
         old_logprob = torch.as_tensor(batch.logprobs, dtype=torch.float32, device=device)
         advantages = torch.as_tensor(batch.advantages, dtype=torch.float32, device=device)
         returns = torch.as_tensor(batch.returns, dtype=torch.float32, device=device)
+        node_valid = torch.as_tensor(batch.node_valid, dtype=torch.bool, device=device)
         source_mask = torch.as_tensor(batch.source_mask, dtype=torch.bool, device=device)
         target_mask = torch.as_tensor(batch.target_mask, dtype=torch.bool, device=device)
 
@@ -54,18 +57,18 @@ class PPOTrainer:
             np.random.shuffle(indices)
             for start in range(0, n, cfg.minibatch_size):
                 mb = indices[start : start + cfg.minibatch_size]
-                mb_obs = obs[mb]
-                mb_act = actions[mb]
-                mb_old = old_logprob[mb]
+                logprob, value, entropy = self.policy.evaluate_batch(
+                    nodes[mb],
+                    edges[mb],
+                    global_f[mb],
+                    node_valid[mb],
+                    actions[mb],
+                    source_mask[mb],
+                    target_mask[mb],
+                )
+                ratio = torch.exp(logprob - old_logprob[mb])
                 mb_adv = advantages[mb]
                 mb_ret = returns[mb]
-                mb_src = source_mask[mb]
-                mb_tgt = target_mask[mb]
-
-                logprob, value, entropy = self.policy.evaluate_batch(
-                    mb_obs, mb_act, mb_src, mb_tgt
-                )
-                ratio = torch.exp(logprob - mb_old)
                 pg1 = -mb_adv * ratio
                 pg2 = -mb_adv * torch.clamp(ratio, 1 - cfg.clip_coef, 1 + cfg.clip_coef)
                 policy_loss = torch.max(pg1, pg2).mean()
@@ -81,7 +84,7 @@ class PPOTrainer:
                 self.optimizer.step()
 
                 with torch.no_grad():
-                    approx_kl = (mb_old - logprob).mean().item()
+                    approx_kl = (old_logprob[mb] - logprob).mean().item()
                 stats["policy_loss"] += policy_loss.item()
                 stats["value_loss"] += value_loss.item()
                 stats["entropy"] += ent_loss.item()

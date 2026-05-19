@@ -36,6 +36,7 @@ __all__ = [
     "filter_safe_angles",
     "sun_safe_mask_angles",
     "intercept_angle_for_target",
+    "rollout_first_event",
     "rollout_first_event_code",
     "reach_indicator_for_target",
     "reach_indicators_from_planet",
@@ -292,6 +293,68 @@ def _bump_comet_path_indices(comets: list[dict[str, Any]]) -> None:
         group["path_index"] = int(group["path_index"]) + 1
 
 
+def rollout_first_event(
+    from_planet: PlanetRow,
+    angle: float,
+    fleet_ships: int,
+    planets: list[PlanetRow],
+    initial_planets: list[PlanetRow],
+    angular_velocity: float,
+    start_step: int,
+    comets: list[dict[str, Any]],
+    comet_planet_ids: list[int],
+    target_id: int,
+    configuration: Configuration,
+    max_ticks: int = 400,
+    *,
+    fleet_xy: tuple[float, float] | None = None,
+) -> tuple[int, int | None, int]:
+    """
+    Discrete rollout aligned with engine movement + planet advance each tick.
+
+    Returns (code, extra, ticks):
+      0 — first contact is target disk (extra target_id)
+      1 — sun first
+      2 — other planet first (extra planet_id)
+      3 — horizon exhausted (no target contact)
+      4 — out of bounds first (extra None)
+      ticks — 0-based movement step index when event occurred, or max_ticks if code==3
+    """
+    sun_radius = _get_cfg(configuration, "sunRadius", SUN_RADIUS)
+    planets = copy.deepcopy(planets)
+    comets = copy.deepcopy(comets)
+    comet_ids = list(comet_planet_ids)
+    step = int(start_step)
+    if fleet_xy is None:
+        fx, fy = fleet_spawn_xy(from_planet, angle)
+    else:
+        fx, fy = float(fleet_xy[0]), float(fleet_xy[1])
+
+    for tick in range(max_ticks):
+        paths = build_planet_paths(planets, initial_planets, angular_velocity, step, comets, comet_ids)
+        ev, detail = _rollout_one_move(
+            (fx, fy), angle, fleet_ships, planets, paths, configuration, target_id, sun_radius
+        )
+        if ev == "target":
+            return 0, target_id, tick
+        if ev == "planet":
+            return 2, int(detail) if detail is not None else None, tick
+        if ev == "sun":
+            return 1, None, tick
+        if ev == "oob":
+            return 4, None, tick
+
+        speed = fleet_speed(fleet_ships, configuration)
+        fx += math.cos(angle) * speed
+        fy += math.sin(angle) * speed
+
+        _advance_planets_inplace(planets, paths)
+        _bump_comet_path_indices(comets)
+        step += 1
+
+    return 3, None, max_ticks
+
+
 def rollout_first_event_code(
     from_planet: PlanetRow,
     angle: float,
@@ -306,47 +369,21 @@ def rollout_first_event_code(
     configuration: Configuration,
     max_ticks: int = 400,
 ) -> tuple[int, int | None]:
-    """
-    Discrete rollout aligned with engine movement + planet advance each tick.
-
-    Returns (code, extra):
-      0 — first contact is target disk (extra target_id)
-      1 — sun first
-      2 — other planet first (extra planet_id)
-      3 — horizon exhausted (no target contact)
-      4 — out of bounds first (extra None)
-    """
-    sun_radius = _get_cfg(configuration, "sunRadius", SUN_RADIUS)
-    planets = copy.deepcopy(planets)
-    comets = copy.deepcopy(comets)
-    comet_ids = list(comet_planet_ids)
-    step = int(start_step)
-    fx, fy = fleet_spawn_xy(from_planet, angle)
-
-    for _ in range(max_ticks):
-        paths = build_planet_paths(planets, initial_planets, angular_velocity, step, comets, comet_ids)
-        ev, detail = _rollout_one_move(
-            (fx, fy), angle, fleet_ships, planets, paths, configuration, target_id, sun_radius
-        )
-        if ev == "target":
-            return 0, target_id
-        if ev == "planet":
-            return 2, int(detail) if detail is not None else None
-        if ev == "sun":
-            return 1, None
-        if ev == "oob":
-            return 4, None
-
-        # fleet survived — advance to end-of-tick position
-        speed = fleet_speed(fleet_ships, configuration)
-        fx += math.cos(angle) * speed
-        fy += math.sin(angle) * speed
-
-        _advance_planets_inplace(planets, paths)
-        _bump_comet_path_indices(comets)
-        step += 1
-
-    return 3, None
+    code, extra, _ticks = rollout_first_event(
+        from_planet,
+        angle,
+        fleet_ships,
+        planets,
+        initial_planets,
+        angular_velocity,
+        start_step,
+        comets,
+        comet_planet_ids,
+        target_id,
+        configuration,
+        max_ticks,
+    )
+    return code, extra
 
 
 def _aim_naive(from_planet: PlanetRow, target: PlanetRow) -> float:

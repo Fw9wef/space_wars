@@ -11,8 +11,8 @@ from kaggle_environments import make
 
 from rl.action import decode_action
 from rl.buffer import RolloutBuffer
-from rl.encoding import encode_observation
-from rl.policy import ActorCritic
+from rl.graph_encoding import GraphFeatureConfig, GraphFeatureState, encode_graph_observation
+from rl.graph_policy import GraphActorCritic
 from rl.rewards import (
     PlayerRewardState,
     RewardConfig,
@@ -62,13 +62,14 @@ class RolloutCollector:
 
     def __init__(
         self,
-        policy: ActorCritic,
+        policy: GraphActorCritic,
         *,
         seed: int = 0,
         episode_steps: int = 500,
         reward_config: RewardConfig | None = None,
         training_progress: float = 0.0,
         four_player_fraction: float = 0.5,
+        graph_config: GraphFeatureConfig | None = None,
         debug: bool = False,
     ) -> None:
         self.policy = policy
@@ -77,10 +78,12 @@ class RolloutCollector:
         self.reward_config = reward_config or RewardConfig()
         self.training_progress = training_progress
         self.four_player_fraction = four_player_fraction
+        self.graph_config = graph_config or GraphFeatureConfig()
         self._rng = np.random.default_rng(seed)
         self.debug = debug
         self._env = None
         self._num_agents = 2
+        self._graph_states: list[GraphFeatureState] = []
 
     def _make_env(self) -> None:
         self._env = make(
@@ -96,6 +99,13 @@ class RolloutCollector:
             return 4
         return 4 if self._rng.random() < self.four_player_fraction else 2
 
+    def _init_graph_states(self, obs_list: list[Any]) -> None:
+        self._graph_states = []
+        for obs in obs_list:
+            st = GraphFeatureState(config=self.graph_config)
+            st.reset(obs, episode_steps=self.episode_steps)
+            self._graph_states.append(st)
+
     def _reset(self, seed: int | None = None, num_agents: int | None = None) -> list[Any]:
         if self._env is None:
             self._make_env()
@@ -107,22 +117,27 @@ class RolloutCollector:
             num_agents = self._sample_num_agents()
         self._num_agents = num_agents
         self._env.reset(num_agents=num_agents)
-        return [observation_for_player(self._env.state, i) for i in range(num_agents)]
+        obs_list = [observation_for_player(self._env.state, i) for i in range(num_agents)]
+        self._init_graph_states(obs_list)
+        return obs_list
 
-    def _policy_moves(self, raw_obs: Any, *, deterministic: bool) -> tuple:
-        obs_vec, enc_info = encode_observation(raw_obs)
-        action, logprob, value = self.policy.act(
-            obs_vec,
-            enc_info["source_mask"],
-            enc_info["target_mask"],
-            deterministic=deterministic,
+    def _policy_moves(
+        self,
+        raw_obs: Any,
+        graph_state: GraphFeatureState,
+        *,
+        deterministic: bool,
+    ) -> tuple:
+        graph_obs, _ = encode_graph_observation(
+            raw_obs, graph_state, episode_steps=self.episode_steps
         )
+        action, logprob, value = self.policy.act(graph_obs, deterministic=deterministic)
         moves = decode_action(
             raw_obs,
             action,
-            enc_info["slot_planet_ids"],
+            graph_obs.slot_planet_ids,
         )
-        return moves, obs_vec, enc_info, action, logprob, value
+        return moves, graph_obs, action, logprob, value
 
     def collect(
         self,
@@ -152,9 +167,14 @@ class RolloutCollector:
         last_value = 0.0
 
         while collected < n_steps and not self._env.done:
-            step_out = [self._policy_moves(obs, deterministic=deterministic) for obs in obs_list]
+            step_out = [
+                self._policy_moves(
+                    obs, self._graph_states[i], deterministic=deterministic
+                )
+                for i, obs in enumerate(obs_list)
+            ]
             moves = [out[0] for out in step_out]
-            values = [out[5] for out in step_out]
+            values = [out[4] for out in step_out]
             last_value = float(sum(values)) / len(values)
 
             self._env.step(moves)
@@ -179,17 +199,8 @@ class RolloutCollector:
                     ep_stats.terminals[i] = t_i
 
             for i in range(num_agents):
-                moves_i, vec_i, info_i, act_i, lp_i, val_i = step_out[i]
-                buffer.add(
-                    vec_i,
-                    act_i,
-                    lp_i,
-                    val_i,
-                    rewards[i],
-                    done,
-                    info_i["source_mask"],
-                    info_i["target_mask"],
-                )
+                moves_i, graph_obs_i, act_i, lp_i, val_i = step_out[i]
+                buffer.add(graph_obs_i, act_i, lp_i, val_i, rewards[i], done)
                 ep_stats.rewards[i] += rewards[i]
                 collected += 1
 
@@ -205,8 +216,10 @@ class RolloutCollector:
             if progress_callback and log_interval > 0 and ep_stats.steps % log_interval == 0:
                 progress_callback(ep_stats.steps, collected)
 
-        if not self._env.done:
-            _, _, _, _, _, last_value = self._policy_moves(obs_list[0], deterministic=True)
+        if not self._env.done and self._graph_states:
+            _, _, _, _, last_value = self._policy_moves(
+                obs_list[0], self._graph_states[0], deterministic=True
+            )
 
         return collected, ep_stats, last_value
 
@@ -236,27 +249,50 @@ def run_match(
 
 
 class RLAgent:
-    """Callable Kaggle agent backed by ActorCritic checkpoint."""
+    """Callable Kaggle agent backed by GraphActorCritic checkpoint."""
 
-    def __init__(self, policy: ActorCritic, *, deterministic: bool = True) -> None:
+    def __init__(
+        self,
+        policy: GraphActorCritic,
+        *,
+        deterministic: bool = True,
+        graph_config: GraphFeatureConfig | None = None,
+        episode_steps: int = 500,
+    ) -> None:
         self.policy = policy
         self.deterministic = deterministic
+        self.graph_config = graph_config or GraphFeatureConfig()
+        self.episode_steps = episode_steps
+        self._graph_state: GraphFeatureState | None = None
         self.policy.eval()
 
     def __call__(self, obs: Any, configuration: Any = None) -> list:
-        obs_vec, enc_info = encode_observation(obs)
-        action, _, _ = self.policy.act(
-            obs_vec,
-            enc_info["source_mask"],
-            enc_info["target_mask"],
-            deterministic=self.deterministic,
+        if self._graph_state is None:
+            self._graph_state = GraphFeatureState(config=self.graph_config)
+            self._graph_state.reset(obs, episode_steps=self.episode_steps)
+        graph_obs, _ = encode_graph_observation(
+            obs, self._graph_state, episode_steps=self.episode_steps
         )
-        return decode_action(obs, action, enc_info["slot_planet_ids"])
+        action, _, _ = self.policy.act(graph_obs, deterministic=self.deterministic)
+        return decode_action(obs, action, graph_obs.slot_planet_ids)
+
+    def reset_episode(self) -> None:
+        self._graph_state = None
 
     @classmethod
-    def from_checkpoint(cls, path: str, device: str = "cpu", deterministic: bool = True) -> RLAgent:
-        ckpt = torch.load(path, map_location=device)
-        policy = ActorCritic()
+    def from_checkpoint(
+        cls, path: str, device: str = "cpu", deterministic: bool = True
+    ) -> RLAgent:
+        ckpt = torch.load(path, map_location=device, weights_only=False)
+        graph_config = GraphFeatureConfig()
+        if "graph_config" in ckpt:
+            gc = ckpt["graph_config"]
+            graph_config = GraphFeatureConfig(
+                history_steps=int(gc.get("history_steps", 5)),
+                future_steps=int(gc.get("future_steps", 5)),
+                include_edges=bool(gc.get("include_edges", False)),
+            )
+        policy = GraphActorCritic(config=graph_config)
         policy.load_state_dict(ckpt["policy"])
         policy.to(device)
-        return cls(policy, deterministic=deterministic)
+        return cls(policy, deterministic=deterministic, graph_config=graph_config)
