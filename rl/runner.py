@@ -2,7 +2,7 @@
 
 from __future__ import annotations
 
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 from typing import Any, Callable
 
 import numpy as np
@@ -29,14 +29,36 @@ def observation_for_player(env_state: list, player: int) -> Any:
 @dataclass
 class EpisodeStats:
     steps: int = 0
-    reward_p0: float = 0.0
-    reward_p1: float = 0.0
-    terminal_p0: float = 0.0
-    terminal_p1: float = 0.0
+    num_agents: int = 2
+    rewards: list[float] = field(default_factory=list)
+    terminals: list[float] = field(default_factory=list)
+
+    @property
+    def reward_p0(self) -> float:
+        return self.rewards[0] if self.rewards else 0.0
+
+    @property
+    def reward_p1(self) -> float:
+        return self.rewards[1] if len(self.rewards) > 1 else 0.0
+
+    @property
+    def terminal_p0(self) -> float:
+        return self.terminals[0] if self.terminals else 0.0
+
+    @property
+    def terminal_p1(self) -> float:
+        return self.terminals[1] if len(self.terminals) > 1 else 0.0
+
+
+def format_episode_stats(ep_stats: EpisodeStats) -> str:
+    n = ep_stats.num_agents
+    parts = [f"ep_r{i}={ep_stats.rewards[i]:.2f}" for i in range(n)]
+    suffix = " 4p" if n == 4 else ""
+    return " ".join(parts) + suffix
 
 
 class RolloutCollector:
-    """Collect PPO transitions from 2-player self-play (shared policy)."""
+    """Collect PPO transitions from self-play (shared policy), 2p or 4p FFA."""
 
     def __init__(
         self,
@@ -46,6 +68,7 @@ class RolloutCollector:
         episode_steps: int = 500,
         reward_config: RewardConfig | None = None,
         training_progress: float = 0.0,
+        four_player_fraction: float = 0.5,
         debug: bool = False,
     ) -> None:
         self.policy = policy
@@ -53,8 +76,11 @@ class RolloutCollector:
         self.episode_steps = episode_steps
         self.reward_config = reward_config or RewardConfig()
         self.training_progress = training_progress
+        self.four_player_fraction = four_player_fraction
+        self._rng = np.random.default_rng(seed)
         self.debug = debug
         self._env = None
+        self._num_agents = 2
 
     def _make_env(self) -> None:
         self._env = make(
@@ -63,17 +89,25 @@ class RolloutCollector:
             debug=self.debug,
         )
 
-    def _reset(self, seed: int | None = None) -> tuple[Any, Any]:
+    def _sample_num_agents(self) -> int:
+        if self.four_player_fraction <= 0.0:
+            return 2
+        if self.four_player_fraction >= 1.0:
+            return 4
+        return 4 if self._rng.random() < self.four_player_fraction else 2
+
+    def _reset(self, seed: int | None = None, num_agents: int | None = None) -> list[Any]:
         if self._env is None:
             self._make_env()
         if seed is not None:
             self.seed = seed
             self._env = None
             self._make_env()
-        self._env.reset(num_agents=2)
-        obs0 = observation_for_player(self._env.state, 0)
-        obs1 = observation_for_player(self._env.state, 1)
-        return obs0, obs1
+        if num_agents is None:
+            num_agents = self._sample_num_agents()
+        self._num_agents = num_agents
+        self._env.reset(num_agents=num_agents)
+        return [observation_for_player(self._env.state, i) for i in range(num_agents)]
 
     def _policy_moves(self, raw_obs: Any, *, deterministic: bool) -> tuple:
         obs_vec, enc_info = encode_observation(raw_obs)
@@ -106,55 +140,73 @@ class RolloutCollector:
         Returns (steps_collected, last_episode_stats, bootstrap_value).
         """
         alpha, beta = self.reward_config.coeffs(self.training_progress)
-        obs0, obs1 = self._reset(seed)
-        rstate0 = init_reward_state(obs0, 0)
-        rstate1 = init_reward_state(obs1, 1)
-        ep_stats = EpisodeStats()
+        obs_list = self._reset(seed)
+        num_agents = self._num_agents
+        rstates = [init_reward_state(obs, i) for i, obs in enumerate(obs_list)]
+        ep_stats = EpisodeStats(
+            num_agents=num_agents,
+            rewards=[0.0] * 4,
+            terminals=[0.0] * 4,
+        )
         collected = 0
         last_value = 0.0
 
         while collected < n_steps and not self._env.done:
-            moves0, vec0, info0, act0, lp0, val0 = self._policy_moves(obs0, deterministic=deterministic)
-            moves1, vec1, info1, act1, lp1, val1 = self._policy_moves(obs1, deterministic=deterministic)
-            last_value = (val0 + val1) / 2.0
+            step_out = [self._policy_moves(obs, deterministic=deterministic) for obs in obs_list]
+            moves = [out[0] for out in step_out]
+            values = [out[5] for out in step_out]
+            last_value = float(sum(values)) / len(values)
 
-            self._env.step([moves0, moves1])
+            self._env.step(moves)
 
-            obs0_next = observation_for_player(self._env.state, 0)
-            obs1_next = observation_for_player(self._env.state, 1)
+            obs_list_next = [
+                observation_for_player(self._env.state, i) for i in range(num_agents)
+            ]
 
-            r0, rstate0 = shaped_step_reward(obs0_next, rstate0, 0, alpha=alpha, beta=beta)
-            r1, rstate1 = shaped_step_reward(obs1_next, rstate1, 1, alpha=alpha, beta=beta)
+            rewards = []
+            for i in range(num_agents):
+                r_i, rstates[i] = shaped_step_reward(
+                    obs_list_next[i], rstates[i], i, alpha=alpha, beta=beta
+                )
+                rewards.append(r_i)
 
             done = self._env.done
             if done:
                 final = self._env.state
-                t0 = terminal_reward(final, 0)
-                t1 = terminal_reward(final, 1)
-                r0 += t0
-                r1 += t1
-                ep_stats.terminal_p0 = t0
-                ep_stats.terminal_p1 = t1
+                for i in range(num_agents):
+                    t_i = terminal_reward(final, i)
+                    rewards[i] += t_i
+                    ep_stats.terminals[i] = t_i
 
-            buffer.add(vec0, act0, lp0, val0, r0, done, info0["source_mask"], info0["target_mask"])
-            buffer.add(vec1, act1, lp1, val1, r1, done, info1["source_mask"], info1["target_mask"])
-            collected += 2
-            ep_stats.reward_p0 += r0
-            ep_stats.reward_p1 += r1
+            for i in range(num_agents):
+                moves_i, vec_i, info_i, act_i, lp_i, val_i = step_out[i]
+                buffer.add(
+                    vec_i,
+                    act_i,
+                    lp_i,
+                    val_i,
+                    rewards[i],
+                    done,
+                    info_i["source_mask"],
+                    info_i["target_mask"],
+                )
+                ep_stats.rewards[i] += rewards[i]
+                collected += 1
+
             ep_stats.steps += 1
-
-            obs0, obs1 = obs0_next, obs1_next
+            obs_list = obs_list_next
 
             if done:
-                obs0, obs1 = self._reset()
-                rstate0 = init_reward_state(obs0, 0)
-                rstate1 = init_reward_state(obs1, 1)
+                num_agents = self._sample_num_agents()
+                ep_stats.num_agents = num_agents
+                obs_list = self._reset(num_agents=num_agents)
+                rstates = [init_reward_state(obs, i) for i, obs in enumerate(obs_list)]
 
             if progress_callback and log_interval > 0 and ep_stats.steps % log_interval == 0:
                 progress_callback(ep_stats.steps, collected)
 
         if not self._env.done:
-            _, _, _, _, _, last_value = self._policy_moves(obs0, deterministic=True)
+            _, _, _, _, _, last_value = self._policy_moves(obs_list[0], deterministic=True)
 
         return collected, ep_stats, last_value
 

@@ -19,7 +19,7 @@ from rl.buffer import RolloutBatch, RolloutBuffer
 from rl.policy import ActorCritic
 from rl.ppo import PPOConfig, PPOTrainer
 from rl.rewards import RewardConfig
-from rl.runner import EpisodeStats, RolloutCollector
+from rl.runner import EpisodeStats, RolloutCollector, format_episode_stats
 
 
 def _merge_batches(batches: list[RolloutBatch]) -> RolloutBatch:
@@ -44,6 +44,7 @@ def _collect_rollout(
     n_steps: int,
     progress: float,
     episode_steps: int,
+    four_player_fraction: float,
     reward_config: RewardConfig,
     gamma: float,
     gae_lambda: float,
@@ -56,6 +57,7 @@ def _collect_rollout(
         episode_steps=episode_steps,
         reward_config=reward_config,
         training_progress=progress,
+        four_player_fraction=four_player_fraction,
         debug=False,
     )
     buf = RolloutBuffer(n_steps)
@@ -91,7 +93,18 @@ def save_checkpoint(path: Path, policy: ActorCritic, update: int, total_steps: i
 def parse_args() -> argparse.Namespace:
     p = argparse.ArgumentParser(description="PPO self-play training for Orbit Wars")
     p.add_argument("--total-timesteps", type=int, default=500_000)
-    p.add_argument("--n-steps", type=int, default=4096, help="Transitions per rollout (both players)")
+    p.add_argument(
+        "--n-steps",
+        type=int,
+        default=4096,
+        help="Transitions per rollout (sum over all players each env step)",
+    )
+    p.add_argument(
+        "--four-player-fraction",
+        type=float,
+        default=0.5,
+        help="Fraction of episodes with 4-player FFA (rest are 1v1)",
+    )
     p.add_argument(
         "--n-envs",
         type=int,
@@ -129,7 +142,8 @@ def main() -> None:
 
     print(
         f"Training: device={device} rollouts/update={args.n_envs} "
-        f"steps/rollout={per_rollout} episode_steps={args.episode_steps}",
+        f"steps/rollout={per_rollout} episode_steps={args.episode_steps} "
+        f"four_player_fraction={args.four_player_fraction}",
         flush=True,
     )
 
@@ -147,6 +161,7 @@ def main() -> None:
                 n_steps=per_rollout,
                 progress=progress,
                 episode_steps=args.episode_steps,
+                four_player_fraction=args.four_player_fraction,
                 reward_config=reward_cfg,
                 gamma=ppo_cfg.gamma,
                 gae_lambda=ppo_cfg.gae_lambda,
@@ -172,7 +187,7 @@ def main() -> None:
             f"ent={ent:.4f} kl={stats['approx_kl']:.5f}"
         )
         if ep_stats is not None:
-            msg += f" ep_r0={ep_stats.reward_p0:.2f} ep_r1={ep_stats.reward_p1:.2f}"
+            msg += f" {format_episode_stats(ep_stats)}"
         print(msg, flush=True)
 
         if update % args.save_every == 0:
