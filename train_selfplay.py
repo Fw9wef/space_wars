@@ -21,6 +21,7 @@ from rl.graph_policy import GraphActorCritic
 from rl.ppo import PPOConfig, PPOTrainer
 from rl.rewards import RewardConfig
 from rl.runner import EpisodeStats, RolloutCollector, format_episode_stats
+from rl.tensorboard_logger import TrainingLogger
 
 
 def _merge_batches(batches: list[RolloutBatch]) -> RolloutBatch:
@@ -152,6 +153,17 @@ def parse_args() -> argparse.Namespace:
         type=Path,
         default=_ROOT / "runs" / "ppo_graph_v0",
     )
+    p.add_argument(
+        "--tensorboard-dir",
+        type=Path,
+        default=None,
+        help="TensorBoard log dir (default: <save-dir>/tensorboard)",
+    )
+    p.add_argument(
+        "--no-tensorboard",
+        action="store_true",
+        help="Disable TensorBoard logging",
+    )
     return p.parse_args()
 
 
@@ -168,10 +180,10 @@ def main() -> None:
     ppo_cfg = PPOConfig(lr=args.lr, ent_coef=args.ent_coef)
     trainer = PPOTrainer(policy, ppo_cfg)
     reward_cfg = RewardConfig()
-
-    total_steps = 0
-    update = 0
     per_rollout = max(64, args.n_steps // max(1, args.n_envs))
+
+    tb_dir = args.tensorboard_dir or (args.save_dir / "tensorboard")
+    tb_enabled = not args.no_tensorboard
 
     print(
         f"Training: device={device} rollouts/update={args.n_envs} "
@@ -179,6 +191,34 @@ def main() -> None:
         f"four_player_fraction={args.four_player_fraction}",
         flush=True,
     )
+    if tb_enabled:
+        print(f"TensorBoard: {tb_dir}  (tensorboard --logdir {tb_dir})", flush=True)
+
+    with TrainingLogger(tb_dir, enabled=tb_enabled) as tb:
+        _train_loop(
+            args,
+            policy,
+            graph_config,
+            ppo_cfg,
+            reward_cfg,
+            trainer,
+            per_rollout,
+            tb,
+        )
+
+
+def _train_loop(
+    args: argparse.Namespace,
+    policy: GraphActorCritic,
+    graph_config: GraphFeatureConfig,
+    ppo_cfg: PPOConfig,
+    reward_cfg: RewardConfig,
+    trainer: PPOTrainer,
+    per_rollout: int,
+    tb: TrainingLogger,
+) -> None:
+    total_steps = 0
+    update = 0
 
     while total_steps < args.total_timesteps:
         progress = total_steps / max(1, args.total_timesteps)
@@ -223,6 +263,16 @@ def main() -> None:
         if ep_stats is not None:
             msg += f" {format_episode_stats(ep_stats)}"
         print(msg, flush=True)
+
+        tb.log_update(
+            total_steps,
+            update=update,
+            ppo_stats=stats,
+            rollout_sec=rollout_s,
+            batch_size=batch.size,
+            ep_stats=ep_stats,
+            progress=progress,
+        )
 
         if update % args.save_every == 0:
             ckpt = args.save_dir / "checkpoint.pt"
